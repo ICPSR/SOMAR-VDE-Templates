@@ -1,0 +1,10 @@
+Bastion:
+  ImageName: "windows-server-2025-english-full-base-x86"
+  ImageVersion: "2026.7.15"
+  PowerStateS3BucketKey: "ec2-powerstate.zip"
+Node:
+  ImageName: "ubuntu-server-22-lts-x86"
+  ImageVersion: "2025.9.25"
+Proxy:
+  ImageName: "ubuntu-server-22-lts-x86"
+  ImageVersion: "2025.9.25"

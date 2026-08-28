@@ -1,0 +1,13 @@
+Common:
+  EnclavePrefix: enclave-prefix
+Network:
+  VPCName: "enclave-vpc-10.236.170.0/24"
+  VpcCidrBlock: "10.236.170.0/24"
+  PublicCidrBlock: "10.255.0.0/20"
+Proxy:
+  InstanceType: "t3a.small"
+  KeyName: "enclave-proxy-keypair"
+  PrivateIpAddress: "10.255.0.10"
+  ProxyBastionPort: "3128"
+  ProxyNodePort: "3129"
+  Name: "enclave-proxy"

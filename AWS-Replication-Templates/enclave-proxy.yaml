@@ -1,0 +1,163 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: template for envlace proxy
+
+Parameters:
+  EnclaveConstants:
+    Type: String
+    Description: Name of file containing constants for Enclave
+    Default: enclave-constants.yaml
+
+Mappings:
+  EnclaveConstants:
+    'Fn::Transform':
+      Name: 'AWS::Include'
+      Parameters:
+        # s3://enclave-templates-<accountid>-<region>/enclave-constants.yaml
+        Location: !Sub s3://enclave-templates-${AWS::AccountId}-${AWS::Region}/${EnclaveConstants}
+
+Resources:
+  EnclaveProxyLocalKey:
+    Type: 'AWS::EC2::KeyPair'
+    Properties:
+      KeyName: !FindInMap [EnclaveConstants, Proxy, KeyName]
+  #**************************
+  # Proxy
+  #**************************
+  Proxy:
+    Type: 'AWS::EC2::Instance'
+    Properties:
+      #Instance type to be used for Bastion
+      InstanceType: !FindInMap [EnclaveConstants, Proxy, InstanceType]
+      #AMI ID of image to use for Bastion.  Note this is region specific
+      ImageId:
+        Fn::ImportValue: "ec2-image-builder-ProxyAMIId"
+      #Key Pair used for instance management
+      KeyName: !Ref EnclaveProxyLocalKey
+      NetworkInterfaces:
+        - DeviceIndex: 0
+          GroupSet:
+            - !GetAtt ProxySecurityGroup.GroupId #Proxy Security Group (defined below)
+          PrivateIpAddress: !FindInMap [EnclaveConstants, Proxy, PrivateIpAddress]
+          SubnetId:
+            Fn::ImportValue: "enclave-vpc-PublicSubnet"
+      IamInstanceProfile: !Ref ProxyEC2InstanceProfile
+      UserData:
+        Fn::Base64: 
+          !Sub |
+            #!/bin/bash
+
+            systemctl enable docker
+            systemctl start docker
+          
+            REGION=${AWS::Region}
+            ACCOUNT_ID=${AWS::AccountId}
+            IMAGE_NAME=enclave-squid-proxy
+            TAG=latest
+
+            aws ecr get-login-password --region $REGION | \
+            docker login --username AWS --password-stdin $ACCOUNT_ID.dkr.ecr.$REGION.amazonaws.com
+
+            docker pull $ACCOUNT_ID.dkr.ecr.$REGION.amazonaws.com/$IMAGE_NAME:$TAG
+            docker run -d --name squid-proxy -p 3128:3128 $ACCOUNT_ID.dkr.ecr.$REGION.amazonaws.com/$IMAGE_NAME:$TAG
+      Tags:
+        - Key: 'Name'
+          Value:
+            !Join
+              - ''
+              - - !FindInMap [EnclaveConstants, Common, EnclavePrefix]
+                - '-Proxy'
+
+  #**************************
+  # EC2 Role
+  #**************************
+
+  #Role
+  ProxyEC2Role:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          -
+            Effect: "Allow"
+            Principal:
+              Service:
+                - "ec2.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      Path: "/"
+      #Policy
+      Policies:
+        - PolicyName:
+            !Join
+              - ''
+              - - !FindInMap [EnclaveConstants, Proxy, Name]
+                - '-ProxyPolicy'
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: 'Allow'
+                Action:
+                  - ecr:GetAuthorizationToken
+                  - ecr:BatchGetImage
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchImportUpstreamImage
+                Resource: "*"
+  #Instance Profile
+  ProxyEC2InstanceProfile:
+    Type: 'AWS::IAM::InstanceProfile'
+    Properties:
+      InstanceProfileName:
+        !Join
+          - ''
+          - - !FindInMap [EnclaveConstants, Proxy, Name]
+            - 'ProxyInstanceProfile'
+      Path: '/'
+      Roles:
+        - Ref: 'ProxyEC2Role'
+
+  #**************************
+  # Proxy EIP
+  #**************************
+  ProxyEIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      InstanceId: !Ref Proxy
+  #**************************
+  # Proxy Security Group
+  #**************************
+  ProxySecurityGroup:
+      Type: 'AWS::EC2::SecurityGroup'
+      Properties:
+        GroupName:
+          !Join
+            - '-'
+            - - !FindInMap [EnclaveConstants, Common, EnclavePrefix]
+              - 'ProxySecurityGroup'
+        GroupDescription: 'Security group for Proxy'
+        VpcId: 
+          Fn::ImportValue: "enclave-vpc-EnclaveVPC"
+  #Allow Traffic from instances in this security group
+  ProxyBastionIngress:
+    Type: 'AWS::EC2::SecurityGroupIngress'
+    Properties:
+      GroupId: !GetAtt ProxySecurityGroup.GroupId
+      IpProtocol: 'tcp'
+      FromPort: !FindInMap [EnclaveConstants, Proxy, ProxyBastionPort]
+      ToPort: !FindInMap [EnclaveConstants, Proxy, ProxyBastionPort]
+      SourceSecurityGroupId: !GetAtt ProxySecurityGroup.GroupId
+  ProxyNodeIngress:
+    Type: 'AWS::EC2::SecurityGroupIngress'
+    Properties:
+      GroupId: !GetAtt ProxySecurityGroup.GroupId
+      IpProtocol: 'tcp'
+      FromPort: !FindInMap [EnclaveConstants, Proxy, ProxyNodePort]
+      ToPort: !FindInMap [EnclaveConstants, Proxy, ProxyNodePort]
+      SourceSecurityGroupId: !GetAtt ProxySecurityGroup.GroupId
+
+Outputs:
+  ProxySecurityGroup:
+    Description: Proxy Security Group ID
+    Value: !Ref ProxySecurityGroup
+    Export:
+      Name: "enclave-proxy-ProxySecurityGroup"

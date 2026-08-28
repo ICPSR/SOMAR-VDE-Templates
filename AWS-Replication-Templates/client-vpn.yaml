@@ -1,0 +1,72 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  AWS Client VPN Endpoint Template
+  Operator needs to provide Server ACM ARN, Client ACM ARN, VPC Id, and Bastion Subnet Id.
+
+Parameters:
+  ServerCertificateArn:
+    Type: String
+    Description: ARN of the ACM certificate for the server
+  ClientCertificateArn:
+    Type: String
+    Description: ARN of the ACM certificate for client authentication (mutual authentication)
+
+Resources:
+# Create SG to later attach to the security group of the bastion instances
+  ClientVpnSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: VPN-EndpointSecurityGroup
+      GroupDescription: Security group for Client VPN endpoint
+      VpcId:
+        Fn::ImportValue: "enclave-vpc-EnclaveVPC"
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+
+  ClientVpnEndpoint:
+    Type: AWS::EC2::ClientVpnEndpoint
+    Properties:
+      VpcId:
+        Fn::ImportValue: "enclave-vpc-EnclaveVPC"
+      Description: VPN Endpoint to Connect to Bastion from Local Desktop
+      ClientCidrBlock: 172.16.0.0/22 #ipv4
+      ServerCertificateArn: !Ref ServerCertificateArn
+      AuthenticationOptions:
+        - Type: certificate-authentication
+          MutualAuthentication:
+            ClientRootCertificateChainArn: !Ref ClientCertificateArn
+      ConnectionLogOptions:
+        Enabled: false
+      SecurityGroupIds:
+        - !Ref ClientVpnSecurityGroup
+      TransportProtocol: udp
+      VpnPort: 443
+      SplitTunnel: true
+
+# Associate the vpn with the bastion subnet
+  ClientVpnTargetAssociation:
+    Type: AWS::EC2::ClientVpnTargetNetworkAssociation
+    Properties:
+      ClientVpnEndpointId: !Ref ClientVpnEndpoint
+      SubnetId:
+        Fn::ImportValue: "enclave-vpc-BastionSubnet"
+
+# Authorization Rule, target network cidr set to be the cidr of the bastion subnet
+  ClientVpnAuthorization:
+    Type: AWS::EC2::ClientVpnAuthorizationRule
+    Properties:
+      ClientVpnEndpointId: !Ref ClientVpnEndpoint
+      TargetNetworkCidr:
+        Fn::ImportValue: "enclave-vpc-BastionSubnetCidr"
+      AuthorizeAllGroups: true
+
+Outputs:
+  ClientVpnEndpointId:
+    Description: ID of the Client VPN Endpoint
+    Value: !Ref ClientVpnEndpoint
+  ClientVpnSecurityGroupId:
+    Description: Security group attached to the Client VPN endpoint
+    Value: !Ref ClientVpnSecurityGroup
+    Export:
+      Name: "client-vpn-SecurityGroup"

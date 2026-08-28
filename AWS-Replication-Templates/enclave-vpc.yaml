@@ -1,0 +1,267 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Template to deploy enclave networking resources 
+
+Parameters:
+  EnclaveConstants:
+    Type: String
+    Description: Name of file containing constants for Enclave
+    Default: enclave-constants.yaml
+
+Mappings:
+  VPCParameters:
+    'Fn::Transform':
+      Name: 'AWS::Include'
+      Parameters:
+        # s3://enclave-templates-<accountid>-<region>/<lab>-constants.yaml
+        Location: !Sub s3://enclave-templates-${AWS::AccountId}-${AWS::Region}/${EnclaveConstants}
+
+Resources:
+  # VPC for the enclave
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !FindInMap [VPCParameters, Network, VpcCidrBlock]
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !FindInMap [VPCParameters, Network, VPCName]
+
+  # Enable Cloudwatch to store VPC flow log using the role enclaveFlowLogRole
+  EnclaveFlowLogRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: enclaveFlowLogRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: ''
+            Effect: Allow
+            Principal:
+              Service: vpc-flow-logs.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: FlowLogCloudWatchPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogGroups
+                  - logs:DescribeLogStreams
+                Resource: '*'
+  FlowLog:
+    Type: AWS::EC2::FlowLog
+    Properties:
+      DeliverLogsPermissionArn:
+        !Sub "arn:aws:iam::${AWS::AccountId}:role/enclaveFlowLogRole"
+      LogGroupName: enclaveFlowLogRole
+      ResourceId: !Ref VPC
+      ResourceType: VPC
+      TrafficType: ALL
+
+  # Internet Gateway
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+      - Key: Name
+        Value: Internet Gateway
+  IGWAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  # Attach the public subnet Cidr range to the VPC Cidr
+  PublicSubnetCidr:
+    Type: AWS::EC2::VPCCidrBlock
+    DependsOn: VPC
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !FindInMap [VPCParameters, Network, PublicCidrBlock]
+
+  # Create a private subnet to host the bastion nodes
+  BastionSubnet:
+    Type: AWS::EC2::Subnet
+    DependsOn: VPC
+    Properties:
+      # Create Cidr Block from VPC Cidr, ex: VPC Cidr 10.236.170.0/24 -> Bastion Cidr 10.236.170.0/25
+      CidrBlock: !Select [ 0, !Cidr [ !GetAtt VPC.CidrBlock, 2, 7 ]]
+      # Select the first available AZ from the region
+      AvailabilityZone: !Select
+        - 0
+        - Fn::GetAZs: !Ref 'AWS::Region'
+      VpcId: !Ref VPC
+      MapPublicIpOnLaunch: FALSE
+      Tags:
+      - Key: Name
+        Value: BastionSubnet
+
+  # Create a private subnet to host the compute nodes      
+  NodeSubnet:
+    Type: AWS::EC2::Subnet
+    DependsOn: VPC
+    Properties:
+    # Create Cidr Block from VPC Cidr, ex: VPC Cidr 10.236.170.0/24 -> Bastion Cidr 10.236.170.128/25
+      CidrBlock: !Select [ 1, !Cidr [ !GetAtt VPC.CidrBlock, 2, 7 ]]
+      # Select the first available AZ from the region
+      AvailabilityZone: !Select
+        - 0
+        - Fn::GetAZs: !Ref 'AWS::Region'
+      VpcId: !Ref VPC
+      MapPublicIpOnLaunch: FALSE
+      Tags:
+      - Key: Name
+        Value: NodeSubnet
+
+  # Create a public subnet to host the proxy instance
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    DependsOn: PublicSubnetCidr
+    Properties:
+      CidrBlock: !FindInMap [VPCParameters, Network, PublicCidrBlock]
+      # Select the first available AZ from the region
+      AvailabilityZone: !Select
+        - 0
+        - Fn::GetAZs: !Ref 'AWS::Region'
+      VpcId:
+        Ref: VPC
+      MapPublicIpOnLaunch: true
+      Tags:
+      - Key: Name
+        Value: PublicSubnet
+  
+  # Create the route table to route traffic for the bastion nodes
+  BastionRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId:
+        Ref: VPC
+      Tags:
+      - Key: Name
+        Value: BastionRouteTable
+  BastionSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId:
+        Ref: BastionSubnet
+      RouteTableId:
+        Ref: BastionRouteTable
+
+  # Create the route table to route traffic for the compute nodes
+  NodeRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId:
+        Ref: VPC
+      Tags:
+      - Key: Name
+        Value: NodeRouteTable
+  NodeSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId:
+        Ref: NodeSubnet
+      RouteTableId:
+        Ref: NodeRouteTable
+
+  # Create the route table to route traffic for the proxy instance
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId:
+        Ref: VPC
+      Tags:
+      - Key: Name
+        Value: PublicRouteTable
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId:
+        Ref: PublicSubnet
+      RouteTableId:
+        Ref: PublicRouteTable
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGateway
+    Properties:
+      RouteTableId:
+        Ref: PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId:
+        Ref: InternetGateway
+  
+  # Create an EC2 VPC Endpoint to allow Bastion nodes to control 
+  # the EC2 states of its compute nodes within a private subnet
+  EC2Endpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcEndpointType: Interface
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ec2'
+      VpcId: !Ref VPC
+      PrivateDnsEnabled: True
+      SubnetIds:
+        - !Ref BastionSubnet
+      SecurityGroupIds:
+        - !Ref EC2EndpointSG
+  EC2EndpointSG:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupName: 'EC2EndpointSecurityGroup'
+      GroupDescription: 'Enable HTTPS traffic locally'
+      VpcId: !Ref VPC
+  EC2EndpointSGIngress01:
+    Type: 'AWS::EC2::SecurityGroupIngress'
+    Properties:
+      GroupId: !GetAtt EC2EndpointSG.GroupId
+      IpProtocol: 'tcp'
+      FromPort: '443'
+      ToPort: '443'
+      SourceSecurityGroupId: !GetAtt EC2EndpointSG.GroupId
+
+  # Create a S3 VPC Endpoint to allow Bcompute nodes to access associated S3 buckets
+  S3Endpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcEndpointType: Gateway
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.s3'
+      VpcId: !Ref VPC
+      RouteTableIds:
+      - !Ref NodeRouteTable
+
+
+Outputs:
+  EnclaveVPCOutput:
+    Description: Envlave VPC ID
+    Value: !Ref VPC
+    Export:
+      Name: "enclave-vpc-EnclaveVPC"
+  BastionSubnetOutput:
+    Description: Bastion Subnet ID
+    Value: !Ref BastionSubnet
+    Export:
+      Name: "enclave-vpc-BastionSubnet"
+  BastionSubnetCidr:
+    Description: CIDR block of Bastion Subnet
+    Value: !GetAtt BastionSubnet.CidrBlock
+    Export:
+      Name: "enclave-vpc-BastionSubnetCidr"
+  NodeSubnetOutput:
+    Description: Node SubnetID
+    Value: !Ref NodeSubnet
+    Export:
+      Name: "enclave-vpc-NodeSubnet"
+  PublicSubnetOutput:
+    Description: Public Subnet ID
+    Value: !Ref PublicSubnet
+    Export:
+      Name: "enclave-vpc-PublicSubnet"
+  EC2EndpointSGOutput:
+    Description: EC2 Endpoint SG ID
+    Value: !Ref EC2EndpointSG
+    Export:
+      Name: "enclave-vpc-EC2EndpointSG"

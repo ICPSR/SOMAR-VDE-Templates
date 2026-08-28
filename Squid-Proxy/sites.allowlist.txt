@@ -1,0 +1,4 @@
+.files.pythonhosted.org
+.cloud.r-project.org
+.pypi.python.org
+.pypi.org

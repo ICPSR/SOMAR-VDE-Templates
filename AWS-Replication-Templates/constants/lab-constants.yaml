@@ -1,0 +1,9 @@
+Attributes:
+  Name: "somartestlab"
+  MComm: "somartestlab"
+Bastion:
+  KeyName: "enclave-test-keypair"
+  InstanceType: "t3.medium"
+Node:
+  KeyName: "enclave-test-keypair"
+  InstanceType: "t3.medium"

@@ -1,0 +1,495 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: >
+  Create VPC, subnet, and EC2 Image Builder pipeline to build 
+  1. Ubuntu 22.04 LTS AMI with vlc cmake libfontconfig xrdp ubuntu-desktop awscli R Rstudio JupyterNotebook installed
+  2. Windows 2022 Server AMI with powerstate powershell script and modules installed
+  3. Ubuntu 22.04 LTS AMI with awscli and Docker installed
+
+Parameters:
+  EC2ImageBuilderConstants:
+    Type: String
+    Description: Name of file containing constants for EC2 Image Builder
+    Default: ec2-image-builder-map.yaml
+
+Mappings:
+  EC2ImageBuilderParameters:
+    'Fn::Transform':
+      Name: 'AWS::Include'
+      Parameters:
+      # s3://<TemplateBucket>/ec2-image-builder-map.yaml
+        Location: !Sub s3://enclave-templates-${AWS::AccountId}-${AWS::Region}/${EC2ImageBuilderConstants}
+
+Resources:
+  # Networking
+  VPC:
+   Type: AWS::EC2::VPC
+   Properties:
+    CidrBlock: 10.0.0.0/16
+    EnableDnsSupport: true
+    EnableDnsHostnames: true
+    Tags:
+    - Key: Name
+      Value: ec2-image-builder-vpc
+  
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+      - Key: Name
+        Value: ec2-image-builder-internet-gateway
+
+  IGWAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select
+        - 0
+        - Fn::GetAZs: !Ref 'AWS::Region'
+      Tags:
+      - Key: Name
+        Value: ec2-image-builder-public-subnet
+  
+  PublicRouteTable:
+   Type: AWS::EC2::RouteTable
+   Properties:
+    VpcId: !Ref VPC
+    Tags:
+    - Key: Name
+      Value: ec2-image-builder-public-route-table
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: IGWAttachment
+    Properties:
+      RouteTableId:
+        Ref: PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId:
+        Ref: InternetGateway
+
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId:
+        Ref: PublicSubnet
+      RouteTableId:
+        Ref: PublicRouteTable
+  
+  ImageBuilderSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: !Ref VPC
+      GroupDescription: Image Builder Security Group
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+
+
+# IAM Role
+#EC2 Instance profile for Image Builder service.
+  ImageBuilderRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: ''
+            Effect: Allow
+            Principal:
+              Service: 
+                - ec2.amazonaws.com
+                - imagebuilder.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/EC2InstanceProfileForImageBuilder
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/AmazonEC2FullAccess
+        - arn:aws:iam::aws:policy/AmazonSSMFullAccess 
+      Policies:
+        # Allow Image Builder to pass the role to the build EC2 instance
+        - PolicyName: ImageBuilderPassRole
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: ec2.amazonaws.com
+        - PolicyName: ImageBuilderS3Read
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource:
+                  - !Sub
+                      - arn:aws:s3:::enclave-templates-${AWS::AccountId}-${AWS::Region}/${PowerstateS3BucketKey}
+                      - PowerstateS3BucketKey: !FindInMap [EC2ImageBuilderParameters, Bastion, PowerStateS3BucketKey]
+      Path: /
+
+  ImageBuilderInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref ImageBuilderRole
+
+# EC2 Image Builder Components
+
+# EC2 Image Builder requires SSM connectivity to the run commands and build instance, not preinstalled on ubuntu
+  NodeInstallSSMAgentComponent:
+    Type: AWS::ImageBuilder::Component
+    Properties:
+      Name: node-install-ssm-agent
+      Platform: Linux
+      Version: 1.0.0
+      Data: |
+        name: node-install-ssm-agent
+        schemaVersion: 1.0
+        phases:
+          - name: build
+            steps:
+              - name: InstallSSMAgent
+                action: ExecuteBash
+                inputs:
+                  commands:
+                    - sudo snap install amazon-ssm-agent --classic
+                    - sudo systemctl enable snap.amazon-ssm-agent.amazon-ssm-agent.service
+                    - sudo systemctl start snap.amazon-ssm-agent.amazon-ssm-agent.service
+
+# Base software for node image
+  NodeBaseComponent:
+    Type: AWS::ImageBuilder::Component
+    Properties:
+      Name: node-install-base-software
+      Platform: Linux
+      Version: 1.0.0
+      Data: |
+        name: node-install-base-software
+        schemaVersion: 1.0
+        phases:
+          - name: build
+            steps:
+              - name: InstallSoftwarePackages
+                action: ExecuteBash
+                inputs:
+                  commands:
+                    - sudo apt-get update
+                    - sudo apt-get install -y vlc cmake libfontconfig1 awscli
+  
+# Install ubuntu desktop, xrdp for node image
+  NodeUbuntuDesktopComponent:
+    Type: AWS::ImageBuilder::Component
+    Properties:
+      Name: node-install-ubuntu-desktop
+      Platform: Linux
+      Version: 1.0.0
+      Data: |
+        name: install-ubuntu-desktop
+        schemaVersion: 1.0
+        phases:
+          - name: build
+            steps:
+              - name: InstallUbuntuDesktop
+                action: ExecuteBash
+                inputs:
+                  commands:
+                    - sudo apt-get install -y ubuntu-desktop xrdp
+                    - sudo systemctl enable xrdp
+
+# Install R for node image
+  NodeRComponent:
+    Type: AWS::ImageBuilder::Component
+    Properties:
+      Name: node-install-r-on-ubuntu
+      Platform: Linux
+      Version: 1.0.0
+      Data: |
+        name: install-R-on-ubuntu
+        schemaVersion: 1.0
+        phases:
+          - name: build
+            steps:
+              - name: InstallR
+                action: ExecuteBash
+                inputs:
+                  commands:
+                    - sudo apt-get install -y r-base r-base-dev
+# Install R Studio for node image
+  NodeRStudioComponent:
+    Type: AWS::ImageBuilder::Component
+    Properties:
+      Name: node-install-rstudio
+      Platform: Linux
+      Version: 1.0.0
+      Data: |
+        name: install-rstudio
+        schemaVersion: 1.0
+        phases:
+          - name: build
+            steps:
+              - name: InstallRStudio
+                action: ExecuteBash
+                inputs:
+                  commands:
+                    - sudo apt-get install -y wget
+                    - wget https://download2.rstudio.org/server/jammy/amd64/rstudio-server-2023.12.1-402-amd64.deb
+                    - sudo apt-get install -y ./rstudio-server-*.deb
+                    - sudo systemctl enable rstudio-server
+
+# Install Jupyter lab for node image
+  NodeJupyterComponent:
+    Type: AWS::ImageBuilder::Component
+    Properties:
+      Name: node-install-jupyter-lab
+      Platform: Linux
+      Version: 1.0.0
+      Data: |
+        name: install-jupyter-lab
+        schemaVersion: 1.0
+        phases:
+          - name: build
+            steps:
+              - name: InstallJupyterLab
+                action: ExecuteBash
+                inputs:
+                  commands:
+                    - sudo apt-get install -y python3-pip
+                    - sudo pip3 install notebook jupyterlab
+
+# Download and install powerstate powershell script and AWS Modules for Bastion image
+  BastionWindowsPowerstateComponent:
+    Type: AWS::ImageBuilder::Component
+    Properties:
+      Name: bastion-download-install-powerstate
+      Platform: Windows
+      Version: 1.0.0
+      Description: Download PowerState script and AWS PowerShell modules for Bastion
+      Data: 
+        !Sub
+          - |
+              name: download-install-powerstate
+              schemaVersion: 1.0
+
+              phases:
+                - name: build
+                  steps:
+                    - name: DownloadAndInstall
+                      action: ExecutePowerShell
+                      inputs:
+                        commands:
+                          - |
+                            $ErrorActionPreference = "Stop"
+
+                            # Parameters
+                            $bucket = "${Bucket}"
+                            $key = "${PowerstateS3BucketKey}"
+
+                            # Paths
+                            $downloadDir = "C:\powerstate"
+                            $zipPath = "$downloadDir\powerstate.zip"
+                            $extractPath = "$downloadDir\extracted"
+                            $modulesPath = "C:\Program Files\WindowsPowerShell\Modules"
+                            $scriptPath = "$extractPath\ARC-EC2-Powerstate\ec2-powerstate_gui.ps1"
+                            $shortcutPath = "C:\Users\Public\Desktop\START STOP VM.lnk"
+
+                            Write-Host "Creating temp directories"
+                            New-Item -ItemType Directory -Force -Path $downloadDir | Out-Null
+                            New-Item -ItemType Directory -Force -Path $extractPath | Out-Null
+
+                            Write-Host "Downloading ZIP from S3"
+                            Read-S3Object -BucketName $bucket -Key $key -File $zipPath
+
+                            Write-Host "Extracting ZIP and Removing ZIP file"
+                            Expand-Archive -Path $zipPath -DestinationPath $extractPath -Force
+                            Remove-Item $zipPath -Force
+
+                            # Extract AWS PowerShell modules
+                            $modulesZip = Join-Path $extractPath "ARC-EC2-Powerstate\AWS_Modules.zip"
+                            if (-Not (Test-Path $modulesZip)) {
+                              throw "AWS_Modules.zip not found in archive"
+                            }
+                            Expand-Archive -Path $modulesZip -DestinationPath $modulesPath -Force
+
+                            # Create Public Desktop Shortcut for ec2-powerstate_gui.ps1
+                            $wsh = New-Object -ComObject WScript.Shell
+                            $shortcut = $wsh.CreateShortcut($shortcutPath)
+                            $shortcut.TargetPath = "C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
+                            $shortcut.Arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$scriptPath`""
+                            $shortcut.WorkingDirectory = $downloadDir
+                            $shortcut.IconLocation = "C:\Windows\System32\shell32.dll,1"
+                            $shortcut.Save()
+                    - name: RebootAfterInstall
+                      action: Reboot
+
+          - Bucket: !Sub enclave-templates-${AWS::AccountId}-${AWS::Region}
+            PowerstateS3BucketKey: !FindInMap [EC2ImageBuilderParameters, Bastion, PowerStateS3BucketKey]
+            
+# Install Docker and AWS CLI for proxy image
+  ProxyBaseComponent:
+    Type: AWS::ImageBuilder::Component
+    Properties:
+      Name: proxy-install-base-software
+      Platform: Linux
+      Version: 1.0.0
+      Data: |
+        name: proxy-install-base-software
+        schemaVersion: 1.0
+        phases:
+          - name: build
+            steps:
+              - name: InstallSoftwarePackages
+                action: ExecuteBash
+                inputs:
+                  commands:
+                    - sudo apt-get update
+                    - sudo apt-get install -y docker.io curl unzip
+                    - curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+                    - unzip awscliv2.zip
+                    - ./aws/install
+
+
+# Node EC2 Image Builder Recipe
+  NodeImageRecipe:
+    Type: AWS::ImageBuilder::ImageRecipe
+    Properties:
+      Name: node-ubuntu-22-04
+      Version: 1.0.0
+      ParentImage: !Sub 
+        - "arn:aws:imagebuilder:${AWS::Region}:aws:image/${ImageName}/${ImageVersion}"
+        - ImageName: !FindInMap [EC2ImageBuilderParameters, Node, ImageName]
+          ImageVersion: !FindInMap [EC2ImageBuilderParameters, Node, ImageVersion]
+      Components:
+        - ComponentArn: !Ref NodeInstallSSMAgentComponent
+        - ComponentArn: !Ref NodeBaseComponent
+        - ComponentArn: !Ref NodeUbuntuDesktopComponent
+        - ComponentArn: !Ref NodeRComponent
+        - ComponentArn: !Ref NodeRStudioComponent
+        - ComponentArn: !Ref NodeJupyterComponent
+      BlockDeviceMappings:
+      - DeviceName: /dev/sda1
+        Ebs:
+          VolumeSize: 330
+          VolumeType: gp3
+
+# Bastion EC2 Image Builder Recipe
+  BastionImageRecipe:
+    Type: AWS::ImageBuilder::ImageRecipe
+    Properties:
+      Name: windows-server-2022-bastion
+      Version: 1.0.0
+      ParentImage: !Sub 
+        - "arn:aws:imagebuilder:${AWS::Region}:aws:image/${ImageName}/${ImageVersion}"
+        - ImageName: !FindInMap [EC2ImageBuilderParameters, Bastion, ImageName]
+          ImageVersion: !FindInMap [EC2ImageBuilderParameters, Bastion, ImageVersion]
+      Components:
+        - ComponentArn: !Ref BastionWindowsPowerstateComponent
+          
+# Proxy EC2 Image Builder Recipe
+  ProxyImageRecipe:
+    Type: AWS::ImageBuilder::ImageRecipe
+    Properties:
+      Name: proxy-ubuntu-22-04
+      Version: 1.0.0
+      ParentImage: !Sub 
+        - "arn:aws:imagebuilder:${AWS::Region}:aws:image/${ImageName}/${ImageVersion}"
+        - ImageName: !FindInMap [EC2ImageBuilderParameters, Proxy, ImageName]
+          ImageVersion: !FindInMap [EC2ImageBuilderParameters, Proxy, ImageVersion]
+      Components:
+        - ComponentArn: !Ref NodeInstallSSMAgentComponent
+        - ComponentArn: !Ref ProxyBaseComponent
+    
+# EC2 image builder infrastructure configuration for node image
+  NodeInfrastructureConfig:
+    Type: AWS::ImageBuilder::InfrastructureConfiguration
+    Properties:
+      Name: node-image-builder-infra
+      InstanceProfileName: !Ref ImageBuilderInstanceProfile
+      InstanceTypes:
+        - t3.large
+      SubnetId: !Ref PublicSubnet
+      SecurityGroupIds:
+        - !Ref ImageBuilderSecurityGroup
+      TerminateInstanceOnFailure: true
+
+# EC2 image builder infrastructure configuration for bastion image
+  BastionInfrastructureConfig:
+    Type: AWS::ImageBuilder::InfrastructureConfiguration
+    Properties:
+      Name: bastion-image-builder-infra
+      InstanceProfileName: !Ref ImageBuilderInstanceProfile
+      InstanceTypes:
+        - t3.large
+      SubnetId: !Ref PublicSubnet
+      SecurityGroupIds:
+        - !Ref ImageBuilderSecurityGroup
+      TerminateInstanceOnFailure: true
+
+# EC2 image builder infrastructure configuration for proxy image
+  ProxyInfrastructureConfig:
+    Type: AWS::ImageBuilder::InfrastructureConfiguration
+    Properties:
+      Name: proxy-image-builder-infra
+      InstanceProfileName: !Ref ImageBuilderInstanceProfile
+      InstanceTypes:
+        - t3.large
+      SubnetId: !Ref PublicSubnet
+      SecurityGroupIds:
+        - !Ref ImageBuilderSecurityGroup
+      TerminateInstanceOnFailure: true
+
+# Bastion Image
+  BastionImage:
+    Type: AWS::ImageBuilder::Image
+    Properties:
+      ImageRecipeArn: !Ref BastionImageRecipe
+      InfrastructureConfigurationArn: !Ref BastionInfrastructureConfig
+      ExecutionRole: !GetAtt ImageBuilderRole.Arn
+
+# Node Image
+  NodeImage:
+    Type: AWS::ImageBuilder::Image
+    Properties:
+      ImageRecipeArn: !Ref NodeImageRecipe
+      InfrastructureConfigurationArn: !Ref NodeInfrastructureConfig
+      ExecutionRole: !GetAtt ImageBuilderRole.Arn
+
+# Proxy Image
+  ProxyImage:
+    Type: AWS::ImageBuilder::Image
+    Properties:
+      ImageRecipeArn: !Ref ProxyImageRecipe
+      InfrastructureConfigurationArn: !Ref ProxyInfrastructureConfig
+      ExecutionRole: !GetAtt ImageBuilderRole.Arn
+
+Outputs:
+  # Export the Bastion AMI ID
+  BastionAmiId:
+    Description: "The AMI ID for the Bastion host"
+    Value: !GetAtt BastionImage.ImageId
+    Export:
+      Name: "ec2-image-builder-BastionAMIId"
+
+  # Export the Node AMI ID
+  NodeAmiId:
+    Description: "The AMI ID for the Worker Nodes"
+    Value: !GetAtt NodeImage.ImageId
+    Export:
+      Name: "ec2-image-builder-NodeAMIId"
+
+  # Export the Proxy AMI ID
+  ProxyAmiId:
+    Description: "The AMI ID for the Proxy Instance"
+    Value: !GetAtt ProxyImage.ImageId
+    Export:
+      Name: "ec2-image-builder-ProxyAMIId"

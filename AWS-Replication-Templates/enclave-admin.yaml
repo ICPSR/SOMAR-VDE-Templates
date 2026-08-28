@@ -1,0 +1,145 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Template to deploy enclave adminstration resources
+
+Parameters:
+  AdminRoleArn:
+    Type: String
+    Description: ARN of the IAM role or user to perform admin work of the KMS Key
+  
+
+Resources:
+# Create a KMS Customer Managed Key used to encrypt EBS volume for Bastion and compute node
+  EnclaveKMSAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: alias/enclave-kms-key
+      TargetKeyId: !Ref EnclaveKmsKey
+
+  EnclaveKmsKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: Encryption key for EBS Volumes attached to the instances
+      Enabled: True
+      EnableKeyRotation: False
+      KeySpec: SYMMETRIC_DEFAULT
+      KeyUsage: ENCRYPT_DECRYPT
+      PendingWindowInDays: 7
+      KeyPolicy:
+        Version: "2012-10-17"
+        Id: "enclave-kms-key-policy"
+        Statement:
+          - Sid: Enable Key Access for Administrators
+            Effect: Allow
+            Principal:
+              AWS: !Ref AdminRoleArn
+            Action:
+              - kms:Create*
+              - kms:Describe*
+              - kms:Enable*
+              - kms:List*
+              - kms:Put*
+              - kms:Update*
+              - kms:Revoke*
+              - kms:Disable*
+              - kms:Get*
+              - kms:Delete*
+              - kms:TagResource
+              - kms:UntagResource
+              - kms:ScheduleKeyDeletion
+              - kms:CancelKeyDeletion
+            Resource: "*"
+
+          - Sid: Enable EC2 Usage for EBS at Instance Launch
+            Effect: Allow
+            Principal:
+              AWS: !Join
+                - ''
+                - - 'arn:aws:iam::'
+                  - !Ref AWS::AccountId
+                  - ':root'
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:DescribeKey
+            Resource: "*"
+
+          - Sid: Enable Bastion and Node EC2 Roles Grant Access
+            Effect: Allow
+            Principal:
+              AWS: !Join
+                - ''
+                - - 'arn:aws:iam::'
+                  - !Ref AWS::AccountId
+                  - ':root'
+            Action:
+              - kms:CreateGrant
+              - kms:ListGrants
+              - kms:RevokeGrant
+            Resource: "*"
+            Condition:
+              Bool:
+                kms:GrantIsForAWSResource: "true"
+
+# Creates a Cloudformation admin role for Cloudformation stacks to assume and create resources
+  CloudFormationAdminRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 
+        - cloud-formation-admin-${AccountNumber}
+        - {AccountNumber: !Ref AWS::AccountId}
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: 
+              - !Sub "cloudformation.amazonaws.com"
+          Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AdministratorAccess
+
+  # Creates a S3 bucket to store the Enclave Cloudformation templates      
+  EnclaveTemplateBucket:
+    Type: AWS::S3::Bucket
+    Properties: 
+      AccessControl: Private
+      BucketName: !Sub "enclave-templates-${AWS::AccountId}-${AWS::Region}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration: 
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: 'aws:kms'
+              # this will use the default server-side encryption
+      LoggingConfiguration:
+        DestinationBucketName: !Ref LoggingBucket
+        LogFilePrefix: enclave-template-logs
+      VersioningConfiguration:
+        Status: Enabled
+        
+  # Creates a S3 bucket to store the logs from S3 buckets
+  LoggingBucket:
+    Type: AWS::S3::Bucket
+    Properties: 
+      AccessControl: Private
+      BucketName: !Sub "enclave-logging-${AWS::AccountId}-${AWS::Region}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration: 
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: 'aws:kms'
+              # this will use the default server-side encryption
+      VersioningConfiguration:
+        Status: Enabled
+
+Outputs:
+  LoggingBucketOutput:
+    Description: Logging S3 Bucket
+    Value: !Ref LoggingBucket
+    Export: 
+      Name: "enclave-admin-LoggingBucket"
+
+  EnclaveKmsKeyARNOutput:
+    Description: ARN of the KMS Key created
+    Value: !GetAtt EnclaveKmsKey.Arn
+    Export:
+      Name: "enclave-admin-EnclaveKmsKeyARN"

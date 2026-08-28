@@ -1,0 +1,43 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: EC2 Instance Connect Endpoint for RDP to a private Windows EC2 instance
+
+Parameters:
+  EnclaveVPCStack:
+    Type: String
+    Description: Name of enclave VPC stack
+    Default: enclave-vpc
+
+  BastionSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: The security group ID of the target bastion EC2 instance.
+
+Resources:
+  # Outbound to private bastion SG
+  EICSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for EC2 Instance Connect Endpoint
+      VpcId:
+        Fn::ImportValue: "enclave-vpc-EnclaveVPC"
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 3389
+          ToPort: 3389
+          DestinationSecurityGroupId: !Ref BastionSecurityGroupId
+
+  EC2InstanceConnectEndpoint:
+    Type: AWS::EC2::InstanceConnectEndpoint
+    Properties:
+      SubnetId:
+        Fn::ImportValue: "enclave-vpc-BastionSubnet"
+      SecurityGroupIds:
+        - !Ref EICSecurityGroup
+
+Outputs:
+  EICSecurityGroupId:
+    Description: Security group ID for the EIC Endpoint.
+    Value: !Ref EICSecurityGroup
+
+  EC2InstanceConnectEndpointId:
+    Description: The ID of the created EC2 Instance Connect Endpoint.
+    Value: !Ref EC2InstanceConnectEndpoint
