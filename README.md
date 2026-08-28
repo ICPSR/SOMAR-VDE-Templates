@@ -1,6 +1,8 @@
 # SOMAR-VDE-Replication
 This repository contains the resources, AWS CloudFormation templates, scripts, and documentation required to replicate the SOMAR Virtual Data Enclave (VDE) environment on AWS.
 
+The templates were originally written by [Xinchen Zhou](https://github.com/xinchenzhou1).
+
 # Documentation
 
 Detailed documentation is located in the [`docs/`](docs/) directory.
